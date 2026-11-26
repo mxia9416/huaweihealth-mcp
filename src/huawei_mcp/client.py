@@ -213,9 +213,67 @@ class HuaweiClient:
         return await self.post(p.READ_PATHS["sports_detail"], {
             "startTime": start, "endTime": end, "queryType": 1, "dataType": 2, "sportTypes": list(sport_types)})
 
+    async def motion_paths(self, version: int) -> list[dict]:
+        return await self._by_version("motion_paths", version, {}, "workout records")
+
+    async def health_points_by_version(self, type_id: int, version: int) -> list[dict]:
+        return await self._by_version("health_points_by_version", version, {"type": type_id}, "health records")
+
+    async def health_sequences_by_version(self, type_id: int, version: int) -> list[dict]:
+        return await self._by_version("health_sequences_by_version", version, {"type": type_id, "subTypes": []}, "health sequences")
+
+    async def training_load_daily(self, start_day: int, end_day: int) -> dict:
+        return await self.post(p.READ_PATHS["training_load_daily"], {
+            "startDay": start_day, "endDay": end_day, "type": 300010, "dataType": 2, "deviceCode": 0})
+
+    async def _by_version(self, route: str, version: int, params: dict, data_name: str) -> list[dict]:
+        """Read records and deletions in modification-cursor order."""
+        records: dict[tuple, dict] = {}
+        for _ in range(100):
+            page = await self.post(p.READ_PATHS[route], {**params, "version": version, "dataType": 2, "deviceCode": 0})
+            current = page.get("detailInfos")
+            deleted = page.get("deleteInfos")
+            if any(items is not None and not isinstance(items, list) for items in (current, deleted)):
+                raise HuaweiError(f"Huawei {data_name} returned an invalid page")
+            try:
+                next_version = int(page["currentVersion"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                if not current and not deleted:
+                    return list(records.values())
+                raise HuaweiError(f"Huawei {data_name} returned an invalid cursor") from None
+            if next_version <= version:
+                if not current and not deleted:
+                    return list(records.values())
+                raise HuaweiError(f"Huawei {data_name} cursor did not advance")
+
+            for row in current or []:
+                if isinstance(row, dict):
+                    records[p.cloud_record_key(row)] = row
+            for tombstone in deleted or []:
+                if not isinstance(tombstone, dict):
+                    continue
+                identifiers = {field: p.cloud_record_id(tombstone.get(field)) for field in ("recordId", "dataId")}
+                identifiers = {field: value for field, value in identifiers.items() if value is not None}
+                if identifiers:
+                    records = {key: row for key, row in records.items() if not any(
+                        p.cloud_record_id(row.get(field)) == value for field, value in identifiers.items())}
+            version = next_version
+        raise HuaweiError(f"Huawei {data_name} exceeded the pagination limit")
+
     async def health_data(self, start: int, end: int, type_id: int) -> dict:
         return await self.post(p.HEALTH_DATA_PATH, {
             "startTime": start, "endTime": end, "type": type_id, "queryType": 1, "dataType": 2})
+
+    async def health_samples_by_time(self, type_id: int, start: int, end: int) -> list[dict]:
+        answer = await self.post(p.HEALTH_DATA_PATH, {
+            "startTime": start, "endTime": end, "type": type_id,
+            "queryType": 2, "dataType": 2, "deviceCode": 0})
+        rows = answer.get("detailInfos")
+        if rows is None:
+            return []
+        if not isinstance(rows, list):
+            raise HuaweiError("Huawei health samples returned an invalid response")
+        return rows
 
     async def bind_devices(self) -> dict:
         return await self.post(p.READ_PATHS["bind_devices"], {})

@@ -31,12 +31,18 @@ scale to — so it works with a regular HUAWEI ID and needs no Health Kit develo
 |---|---|
 | `get_body_composition(start_date, end_date, detailed=False, all_people=False)` | Smart-scale measurements and the trend over the period (up to 366 days) |
 | `get_daily_activity(start_date, end_date)` | Steps, distance, calories, active minutes and hours, intensity minutes per day |
-| `get_daily_health(start_date, end_date, metrics=None)` | `sleep` (phases, score, HRV, SpO2), `heart_rate` (resting/min/max), `stress`, `intensity` per day |
-| `get_workouts(start_date, end_date, min_minutes=3)` | Workouts: start/end, duration, distance, steps, calories (totals only, up to 62 days) |
+| `get_daily_health(start_date, end_date, metrics=None)` | `sleep`, `heart_rate`, `stress`, and `intensity` by default. Request `spo2`, `sleep_details`, `naps`, `sleep_insights`, and `training_load` through `metrics`. |
+| `get_diet(start_date, end_date, include_foods=False)` | Diet diary, intake, active/resting expenditure, and separate target and calculated deficit. `include_foods=true` expands the saved foods, quantities, units, and macronutrient fields. |
+| `get_health_samples(date, metric, offset=0, limit=200)` | On-demand measurements for one local date: `heart_rate`, `hrv`, `spo2`, or `emotion`. Returns chronological pages and `next_offset` when more records are available. |
+| `get_workouts(start_date, end_date, min_minutes=3)` | Saved workouts: start/end, duration, distance, steps, active and total calories, and average/min/max heart rate when supplied (up to 62 days). `kcal` aliases `active_kcal`. |
 | `get_devices()` | Devices bound to the account |
 | `get_login_status()` | Whether the login is valid and days left until a browser re-login |
 
 Dates are `YYYY-MM-DD` in the account's time zone (`HUAWEI_TZ`).
+
+The calculated dietary deficit is active plus resting expenditure minus intake, when all three fields are present. The target deficit is the separate value from Huawei. Sleep insight results expose structured Huawei fields, and naps and other optional metrics depend on the account's recorded data.
+
+For weekly reports, start with daily summaries. Use `get_health_samples` for a specific date and metric when an unexpected pattern or question needs further investigation. The default page contains at most 200 samples, and `limit` can be set from 1 to 500. Each page reads the current cloud state, so later updates can shift offsets. Sample counts do not establish the duration of an event.
 
 ## Quick start (Docker)
 
@@ -88,8 +94,8 @@ Check the login at any time with `huawei-mcp-login --verify` (exit code 0 = vali
 - The `ru` cloud is tested end to end; the `eu` and `cn` hosts come from upstream projects.
 - The token pair is shared with the session the cloud issued for this login; if the phone app rotates it,
   the server rotates and retries automatically.
-- Time-range queries are split into the 10-day windows the cloud accepts, so long ranges take several requests.
-- Workouts are rebuilt from per-minute segments: totals only, no heart-rate curve or laps.
+- Daily activity and health are queried in 30-day windows, body composition in 10-day windows, and workout records use a cloud version cursor. Long ranges can take several requests.
+- Workouts use saved motion-path records and are filtered by local start date. Cycling and strength training labels were checked on the CN cloud. Other sports retain their numeric code. Heart-rate summaries are available when recorded; curves and laps are not returned.
 - Measurements without `full_analysis` were taken without the hand electrodes (weight only).
 
 ## Security
