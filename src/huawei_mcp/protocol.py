@@ -8,6 +8,8 @@ Huawei Health 16.1.6.320 и проверен живыми запросами. З
 from __future__ import annotations
 
 import json
+import math
+import re
 import urllib.parse
 import uuid
 from datetime import date, datetime, timedelta, tzinfo
@@ -47,6 +49,10 @@ TOKEN_LIVE_SLACK = 120                # ротируем access-токен за 
 READ_PATHS = {
     "sports_stat": "/dataQuery/sport/v2/getSportsStat",
     "sports_detail": "/dataQuery/sport/getSportsDataByTime",
+    "motion_paths": "/dataQuery/path/getMotionPathByVersion",
+    "health_points_by_version": "/dataQuery/health/getHealthDataByVersion",
+    "health_sequences_by_version": "/dataQuery/sequence/getSampleSequenceByVersion",
+    "training_load_daily": "/dataQuery/report/getSampleReportByDay",
     "health_stat": "/dataQuery/health/getHealthStat",
     "bind_devices": "/profile/device/getBindDevice",
 }
@@ -62,6 +68,13 @@ SPORT_TYPES = {1: "stairs", 2: "hill", 3: "cycling", 4: "running", 5: "walking",
 # 5 — поминутный трек ходьбы за весь день, 6/7/8 — сон: это не тренировки
 SESSION_SPORT_TYPES = tuple(t for t in SPORT_TYPES if t not in (5, 6, 7, 8))
 BY_TIME_WINDOW_DAYS = 10              # *ByTime отвечает 1001 на окно шире 10 дней
+
+# Motion-path sport codes use a separate vocabulary from minute samples.
+MOTION_PATH_SPORTS = {3: "cycling", 140: "strength_training"}
+MOTION_PATH_NUMBERS = re.compile(
+    r'\b(activeCalories?|totalCalories?|avgHeartRate|minHeartRate|maxHeartRate)["\']?\s*[:=]\s*["\']?'
+    r'([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=$|[\s,;}&|)"\'\]])'
+)
 
 AUTH_FAILED_CODES = (1002, 1004)      # пару ротировало приложение — ротируем и повторяем
 BAD_HUID_CODE = 20010004
@@ -159,11 +172,97 @@ def windows(start: date, end: date, days: int) -> Iterator[tuple[int, int]]:
         start = stop + timedelta(days=1)
 
 
+def history_cursor(start: date, zone: tzinfo) -> int:
+    """Start one local day earlier; callers filter records by the actual event date."""
+    baseline = datetime.combine(max(start, date(1970, 1, 2)), datetime.min.time(), zone) - timedelta(days=1)
+    return max(0, int(baseline.timestamp() * 1000))
+
+
 def stamp(ms: Any, tz: tzinfo | None) -> str | None:
     value = to_float(ms)
     if not value or value < 1e12:
         return None
     return datetime.fromtimestamp(value / 1000, tz).strftime("%Y-%m-%d %H:%M")
+
+
+def cloud_record_id(value: Any) -> str | None:
+    # Record IDs may exceed the precision of a float.
+    if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value) not in ("", "0"):
+        return str(value)
+    return None
+
+
+def cloud_record_key(row: dict) -> tuple:
+    for field in ("recordId", "dataId"):
+        if identifier := cloud_record_id(row.get(field)):
+            return field, identifier
+    return ("interval", *(str(row.get(field)) for field in ("startTime", "endTime", "type", "subType", "sportType")))
+
+
+def _motion_number(value: Any) -> float | None:
+    parsed = to_float(value)
+    return parsed if parsed is not None and math.isfinite(parsed) and parsed >= 0 else None
+
+
+def _motion_field(record: dict, attrs: dict, *names: str) -> float | None:
+    for group in (record, attrs):
+        for name in names:
+            value = _motion_number(group.get(name))
+            if value is not None:
+                return value
+    return None
+
+
+def motion_path_workouts(records: Iterable[dict], start: date, end: date, zone: tzinfo,
+                         min_minutes: int) -> list[dict]:
+    workouts = []
+    for record in records:
+        start_ms = _motion_number(record.get("startTime"))
+        end_ms = _motion_number(record.get("endTime"))
+        if start_ms is None or end_ms is None or end_ms < start_ms:
+            continue
+        try:
+            local_start = datetime.fromtimestamp(start_ms / 1000, zone)
+            local_end = datetime.fromtimestamp(end_ms / 1000, zone)
+        except (OverflowError, OSError, ValueError):
+            continue
+        if not start <= local_start.date() <= end:
+            continue
+        duration = _motion_number(record.get("totalTime"))
+        if duration is None:
+            duration = end_ms - start_ms
+        if duration < max(min_minutes, 0) * 60_000:
+            continue
+
+        attrs = record.get("attribute")
+        if isinstance(attrs, str):
+            attrs = dict(MOTION_PATH_NUMBERS.findall(attrs))
+        if not isinstance(attrs, dict):
+            attrs = {}
+        active = _motion_field(record, attrs, "activeCalorie", "activeCalories")
+        total = _motion_field(record, attrs, "totalCalories", "totalCalorie")
+        active_kcal = round(active / 1000, 3) if active is not None else None
+        sport = _motion_number(record.get("sportType"))
+        sport_type = int(sport) if sport is not None else None
+        meters = _motion_number(record.get("totalDistance"))
+        steps = _motion_number(record.get("totalSteps"))
+        workouts.append({
+            "sport": MOTION_PATH_SPORTS.get(sport_type, f"type_{sport_type}" if sport_type is not None else "unknown"),
+            "sport_type": sport_type,
+            "start": local_start.strftime("%Y-%m-%d %H:%M"),
+            "end": local_end.strftime("%Y-%m-%d %H:%M"),
+            "duration_min": round(duration / 60_000, 2),
+            "duration_seconds": round(duration / 1000, 3),
+            "distance_km": round(meters / 1000, 3) if meters else None,
+            "steps": int(steps) if steps else None,
+            "kcal": active_kcal,
+            "active_kcal": active_kcal,
+            "total_kcal": round(total / 1000, 3) if total is not None else None,
+            "avg_heart_rate_bpm": _motion_field(record, attrs, "avgHeartRate") or None,
+            "min_heart_rate_bpm": _motion_field(record, attrs, "minHeartRate") or None,
+            "max_heart_rate_bpm": _motion_field(record, attrs, "maxHeartRate") or None,
+        })
+    return sorted(workouts, key=lambda record: (record["start"], record["end"]))
 
 
 # ── ответы облака ────────────────────────────────────────────────────────

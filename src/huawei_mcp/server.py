@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -26,6 +26,9 @@ from starlette.responses import JSONResponse
 
 from . import protocol as p
 from .client import AuthRequired, HuaweiClient, HuaweiError
+from .daily_extensions import EXTENDED_METRICS, get_extended_daily_health
+from .diet import DIET_RECORD_TYPE, diet_days
+from .samples import SAMPLE_TYPES, health_samples
 
 TZ = ZoneInfo(os.getenv("HUAWEI_TZ", "Europe/Moscow"))
 OWNER_HEIGHT = int(os.getenv("HUAWEI_OWNER_HEIGHT") or 0) or None
@@ -39,7 +42,10 @@ mcp = FastMCP(
     "Huawei Health",
     instructions=(
         "Read-only access to the user's Huawei Health data (the Health app's own cloud, synced from "
-        "the Huawei scale, watch/band and phone). Dates are YYYY-MM-DD in the account's time zone."
+        "the Huawei scale, watch/band and phone). Dates are YYYY-MM-DD in the account's time zone. "
+        "Start weekly reports with daily summaries. If a specific date needs investigation because of a "
+        "potential concern, unexpected value, or the user's question, use get_health_samples for that date "
+        "and metric. Fetch detail pages only as needed and check coverage before drawing conclusions."
     ),
     host=os.getenv("MCP_HOST", "0.0.0.0"),
     port=int(os.getenv("MCP_PORT", "8000")),
@@ -61,9 +67,11 @@ def clean(obj: Any) -> Any:
     return obj
 
 
-def dump(obj: Any) -> str:
+def dump(obj: Any, *, require_complete: bool = False) -> str:
     text = json.dumps(clean(obj), ensure_ascii=False, separators=(",", ":"), default=str)
     if len(text) > MAX_OUTPUT_CHARS:
+        if require_complete:
+            raise ValueError("The result is too large. Query a shorter period or request fewer details.")
         text = text[:MAX_OUTPUT_CHARS] + f"... [обрезано: ответ {len(text)} символов, сузьте период]"
     return text
 
@@ -119,41 +127,92 @@ async def get_daily_activity(start_date: str, end_date: str) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_daily_health(start_date: str, end_date: str, metrics: list[str] | None = None) -> str:
-    """Daily health metrics. metrics: any of "sleep", "heart_rate", "stress", "intensity" (default all).
+    """Daily health metrics. Defaults to sleep, heart_rate, stress, and intensity.
 
     sleep: total/deep/light/REM/awake minutes, score, efficiency, latency, wake-ups, avg HR, HRV, SpO2,
     fell asleep / woke up time (a night belongs to the day of waking up);
     heart_rate: resting, min, max; stress: avg/min/max score; intensity: moderate-to-high minutes.
+    Additional metrics can be requested explicitly: spo2 (independent daily blood oxygen), sleep_details
+    (breathing, snoring and personal baselines), naps, sleep_insights (Huawei codes/parameters), training_load.
     Up to 366 days.
     """
     names = metrics or list(p.HEALTH_TYPES)
-    bad = [m for m in names if m not in p.HEALTH_TYPES]
+    supported = set(p.HEALTH_TYPES) | set(EXTENDED_METRICS)
+    bad = [m for m in names if m not in supported]
     if bad:
-        raise ValueError(f"Неизвестные metrics: {bad}; доступны {list(p.HEALTH_TYPES)}")
+        raise ValueError(f"Неизвестные metrics: {bad}; доступны {sorted(supported)}")
     s, e = date_range(start_date, end_date)
-    types = [p.HEALTH_TYPES[m] for m in names]
     days: dict[str, dict] = {}
-    for a, b in p.windows(s, e, STAT_WINDOW_DAYS):
-        answer = await guarded(client.health_stat(a, b, types))
-        for d, fam in p.health_by_day(answer, TZ).items():
-            days.setdefault(d, {}).update({k: v for k, v in fam.items() if k in names})
+    types = [p.HEALTH_TYPES[m] for m in names if m in p.HEALTH_TYPES]
+    if types:
+        for a, b in p.windows(s, e, STAT_WINDOW_DAYS):
+            answer = await guarded(client.health_stat(a, b, types))
+            for d, fam in p.health_by_day(answer, TZ).items():
+                days.setdefault(d, {}).update({k: v for k, v in fam.items() if k in names})
+    extra = [m for m in names if m in EXTENDED_METRICS]
+    if extra:
+        additions = await guarded(get_extended_daily_health(client, s, e, extra, TZ))
+        for day, metrics_for_day in additions.items():
+            days.setdefault(day, {}).update(metrics_for_day)
     rows = [{"date": d, **days[d]} for d in sorted(days) if days[d]]
-    return dump(rows) if rows else "За период нет данных"
+    return dump(rows, require_complete=bool(extra)) if rows else "За период нет данных"
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_health_samples(date: str, metric: str, offset: int = 0, limit: int = 200) -> str:
+    """On-demand timestamped measurements for one account-local date (YYYY-MM-DD).
+
+    metric is heart_rate, hrv (RMSSD), spo2 (the value for each record's measurement window), or emotion.
+    Use daily summaries first; request a specific date
+    when a potential concern, unexpected pattern, or user question needs investigation. Samples are observations,
+    and their counts are not durations. This tool does not diagnose conditions. offset/limit paginate the sorted
+    records, with at most 500 per response. Follow next_offset only when needed; pages reflect current cloud data.
+    """
+    if metric not in SAMPLE_TYPES:
+        raise ValueError(f"metric must be one of {sorted(SAMPLE_TYPES)}")
+    if offset < 0 or not 1 <= limit <= 500:
+        raise ValueError("offset must be nonnegative and limit must be between 1 and 500")
+    day, _ = date_range(date, date)
+    type_id = SAMPLE_TYPES[metric]
+    if metric == "emotion":
+        raw = await guarded(client.health_points_by_version(type_id, p.history_cursor(day, TZ)))
+    else:
+        start = datetime.combine(day, datetime.min.time(), TZ)
+        next_day = start + timedelta(days=1)
+        raw = await guarded(client.health_samples_by_time(
+            type_id, int(start.timestamp() * 1000), int(next_day.timestamp() * 1000) - 1))
+    rows = health_samples(raw, metric, day, TZ)
+    stop = min(offset + limit, len(rows))
+    return dump({"date": date, "metric": metric, "timezone": str(TZ), "total_records": len(rows),
+                 "offset": offset, "returned_records": len(rows[offset:stop]),
+                 "next_offset": stop if stop < len(rows) else None,
+                 "records": rows[offset:stop]}, require_complete=True)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_diet(start_date: str, end_date: str, include_foods: bool = False) -> str:
+    """Huawei diet diary by local date. Returns intake, activity and resting expenditure, and the target deficit.
+
+    The calculated deficit is active + resting expenditure - intake and requires all three values. Set
+    include_foods=true for meals and individual foods, including the recorded units and nutrient values.
+    Use shorter ranges for detailed meals. Days without a diary are omitted.
+    """
+    s, e = date_range(start_date, end_date)
+    records = await guarded(client.health_points_by_version(DIET_RECORD_TYPE, p.history_cursor(s, TZ)))
+    rows = diet_days(records, s, e, TZ, include_foods)
+    return dump(rows, require_complete=True) if rows else "За период нет данных о питании"
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_workouts(start_date: str, end_date: str, min_minutes: int = 3) -> str:
-    """Workouts recorded by the Huawei device or phone (running, cycling, swimming, hill, stairs, other):
-    start/end time, duration, distance, steps, calories — totals only, no heart rate or laps. Sessions shorter than min_minutes (default 3)
-    are dropped — the phone records stairs/short walks as tiny sessions. Up to 62 days."""
+    """Saved workouts, including cycling and strength training, by local start date.
+
+    Returns start/end, duration, distance, steps, separate active and total calories, and average/min/max heart rate
+    when Huawei provides them. The legacy kcal field is active calories. Unknown sports keep their numeric code.
+    Sessions shorter than min_minutes (default 3) are excluded. Up to 62 days."""
     s, e = date_range(start_date, end_date, WORKOUT_RANGE_DAYS)
-    records = await guarded(client.by_time(
-        lambda a, b: client.sports_detail(a, b, p.SESSION_SPORT_TYPES),
-        p.windows(s, e, p.BY_TIME_WINDOW_DAYS)))
-    sessions = [x for x in p.sport_sessions(records, TZ) if x["duration_min"] >= max(min_minutes, 0)]
-    for x in sessions:
-        x.pop("device_code", None)
-        x.pop("segments", None)
+    records = await guarded(client.motion_paths(p.history_cursor(s, TZ)))
+    sessions = p.motion_path_workouts(records, s, e, TZ, min_minutes)
     return dump(sessions) if sessions else "За период тренировок нет"
 
 
